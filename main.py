@@ -18,7 +18,7 @@ HF_API_KEY = os.environ.get("HF_API_KEY", "YOUR_HF_TOKEN_HERE")
 
 ADMIN_ID = 8768764605
 DB_FILE = "users_db.json"
-ADMIN_CONTACT_URL = "https://t.me/YourAdminUsername" # এখানে তোর আসল ইউজারনেম দিবি
+ADMIN_CONTACT_URL = "https://t.me/Automait" # এখানে তোর আসল ইউজারনেম দিবি
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
