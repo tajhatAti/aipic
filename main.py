@@ -1,176 +1,155 @@
 import os
 import threading
 import urllib.parse
-import io
 import json
-import datetime
-import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import google.generativeai as genai
-from PIL import Image
 
 # ===================== CONFIG =====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_KEY_HERE")
-HF_API_KEY = os.environ.get("HF_API_KEY", "YOUR_HF_TOKEN_HERE")
-
 ADMIN_ID = 8768764605
 DB_FILE = "users_db.json"
-ADMIN_CONTACT_URL = "https://t.me/Automait" # এখানে তোর আসল ইউজারনেম দিবি
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
+# Gemini Setup
 genai.configure(api_key=GEMINI_API_KEY)
 ai_model = genai.GenerativeModel('gemini-1.5-flash')
-
-HF_API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
-headers = {"Authorization": f"Bearer {HF_API_KEY}"}
-
-# টেম্পোরারি প্রম্পট স্টোরেজ
-user_prompts = {}
 
 # ===================== DATABASE LOGIC =====================
 def load_db():
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r") as f:
-            return json.load(f)
+            try:
+                return json.load(f)
+            except json.JSONDecodeError:
+                return {}
     return {}
 
 def save_db(db):
     with open(DB_FILE, "w") as f:
-        json.dump(db, f)
+        json.dump(db, f, indent=4)
 
-def get_user_data(user_id):
+def track_user_prompt(user_id, username, prompt):
     db = load_db()
     uid = str(user_id)
-    today = str(datetime.date.today())
     
     if uid not in db:
-        db[uid] = {"limit": 4, "used": 0, "last_used_date": today}
-    else:
-        # নতুন দিন হলে লিমিট রিসেট হবে
-        if db[uid]["last_used_date"] != today:
-            db[uid]["used"] = 0
-            db[uid]["last_used_date"] = today
-            
-    save_db(db)
-    return db[uid]
-
-def update_user_usage(user_id):
-    db = load_db()
-    uid = str(user_id)
-    db[uid]["used"] += 1
-    save_db(db)
-
-def set_user_limit(user_id, new_limit):
-    db = load_db()
-    uid = str(user_id)
-    today = str(datetime.date.today())
-    if uid not in db:
-        db[uid] = {"limit": new_limit, "used": 0, "last_used_date": today}
-    else:
-        db[uid]["limit"] = new_limit
+        db[uid] = {"username": username, "history": []}
+        
+    # Update username in case they changed it
+    db[uid]["username"] = username 
+    
+    # Initialize history list if it's an old DB structure
+    if "history" not in db[uid]:
+        db[uid]["history"] = []
+        
+    db[uid]["history"].append(prompt)
+    
+    # Keep only the last 50 prompts so the DB doesn't get too large
+    db[uid]["history"] = db[uid]["history"][-50:] 
+    
     save_db(db)
 
-# ===================== IMAGE GENERATORS =====================
-def generate_hf_image(prompt):
-    payload = {"inputs": prompt}
-    try:
-        response = requests.post(HF_API_URL, headers=headers, json=payload)
-        if response.status_code == 200:
-            return response.content
-        return None
-    except:
-        return None
-
+# ===================== IMAGE PROMPT ENHANCER =====================
 def enhance_prompt(user_input):
     instruction = "Rewrite this into a highly detailed visual prompt for an AI image generator. No text rendering instructions. Return English only."
     try:
         response = ai_model.generate_content(instruction + "\nUser Input: " + user_input)
         return response.text.strip()
-    except:
-        return user_input
+    except Exception as e:
+        print(f"Gemini Error: {e}")
+        return user_input # Fallback to original if API fails
 
-# ===================== ADMIN COMMAND =====================
-@bot.message_handler(commands=['limit'])
-def admin_set_limit(message):
+# ===================== ADMIN COMMANDS =====================
+@bot.message_handler(commands=['view'])
+def admin_view_users(message):
     if message.from_user.id != ADMIN_ID:
         bot.reply_to(message, "❌ You do not have admin permission.")
         return
     
-    try:
-        parts = message.text.split()
-        target_uid = parts[1]
-        new_limit = int(parts[2])
-        set_user_limit(target_uid, new_limit)
-        bot.reply_to(message, f"✅ User {target_uid}'s limit has been updated to {new_limit} per day.")
-    except:
-        bot.reply_to(message, "⚠️ Format error. Use: `/limit user_id number` (e.g., /limit 12345 10)", parse_mode="Markdown")
+    db = load_db()
+    if not db:
+        bot.reply_to(message, "📭 Database is empty. No users yet.")
+        return
+        
+    markup = InlineKeyboardMarkup()
+    for uid, data in db.items():
+        uname = data.get("username", "Unknown")
+        # Creating button for each user
+        btn_text = f"👤 {uname}"
+        markup.row(InlineKeyboardButton(btn_text, callback_data=f"view_{uid}"))
+        
+    bot.reply_to(message, "📋 **Total User List:**\nClick a user to view their prompt history.", reply_markup=markup, parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('view_'))
+def handle_view_callback(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Access Denied.")
+        return
+        
+    uid = call.data.split('_')[1]
+    db = load_db()
+    
+    if uid in db:
+        uname = db[uid].get("username", "Unknown")
+        history = db[uid].get("history", [])
+        
+        if not history:
+            text = f"📭 User **{uname}** has no generated prompts yet."
+        else:
+            text = f"📜 **Prompt History for {uname} (Last 10):**\n\n"
+            # Display last 10 prompts to prevent huge messages
+            for i, p in enumerate(history[-10:], start=1):
+                text += f"**{i}.** `{p}`\n\n"
+                
+        # Truncate text if it exceeds Telegram's limit
+        if len(text) > 4000:
+            text = text[:4000] + "\n...[Truncated]"
+            
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+    else:
+        bot.answer_callback_query(call.id, "❌ User not found in DB.")
 
 # ===================== USER HANDLERS =====================
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    bot.reply_to(message, "👋 Welcome! Send me a text prompt to generate an image.\n\n"
-                          "🔹 **Free Mode:** Unlimited (Basic Quality)\n"
-                          "🔸 **Pro Mode:** High Quality (Limit: 4/day)", parse_mode="Markdown")
+    bot.reply_to(message, "👋 Welcome! Just send me any text prompt, and I will enhance it using AI and generate a beautiful image for you!")
 
 @bot.message_handler(func=lambda message: True)
 def handle_text_prompt(message):
     user_id = message.from_user.id
-    user_prompts[user_id] = message.text
+    username = message.from_user.username or message.from_user.first_name
+    user_text = message.text
     
-    markup = InlineKeyboardMarkup()
-    markup.row(InlineKeyboardButton("🟢 Free (Unlimited)", callback_data="model_free"))
-    markup.row(InlineKeyboardButton("🌟 Pro (High Quality)", callback_data="model_pro"))
+    # Save to database
+    track_user_prompt(user_id, username, user_text)
     
-    bot.reply_to(message, "⚙️ Choose generation mode:", reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: True)
-def callback_query(call):
-    user_id = call.from_user.id
-    if user_id not in user_prompts:
-        bot.answer_callback_query(call.id, "❌ Prompt expired. Send text again.")
-        return
-        
-    user_text = user_prompts[user_id]
+    # Sending a loading message
+    processing_msg = bot.reply_to(message, "⏳ Processing... Enhancing your prompt and generating image.")
     
-    if call.data == "model_free":
-        bot.edit_message_text("⏳ Generating Free Image...", call.message.chat.id, call.message.message_id)
-        smart_prompt = enhance_prompt(user_text)
-        safe_prompt = urllib.parse.quote(smart_prompt)
-        image_url = f"https://image.pollinations.ai/prompt/{safe_prompt}?width=1024&height=1024&nologo=true"
-        
-        caption = f"👤 **Input:** `{user_text}`\n⚙️ **Mode:** Free"
-        try:
-            bot.send_photo(call.message.chat.id, image_url, caption=caption, parse_mode="Markdown")
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            bot.edit_message_text("❌ Error generating image.", call.message.chat.id, call.message.message_id)
-            
-    elif call.data == "model_pro":
-        user_data = get_user_data(user_id)
-        if user_data["used"] >= user_data["limit"]:
-            markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("👨‍💻 Admin Contact", url=ADMIN_CONTACT_URL))
-            bot.edit_message_text("🚫 **Daily Pro Limit Reached!**\n\nYou have used your daily limit. Contact the admin to increase your limit.", 
-                                  call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=markup)
-            return
-            
-        bot.edit_message_text("🌟 Generating Pro Image... Please wait.", call.message.chat.id, call.message.message_id)
-        smart_prompt = enhance_prompt(user_text)
-        image_bytes = generate_hf_image(smart_prompt)
-        
-        if image_bytes:
-            update_user_usage(user_id)
-            new_data = get_user_data(user_id)
-            caption = f"👤 **Input:** `{user_text}`\n🌟 **Mode:** Pro\n📊 **Used:** {new_data['used']}/{new_data['limit']}"
-            
-            bot.send_photo(call.message.chat.id, photo=io.BytesIO(image_bytes), caption=caption, parse_mode="Markdown")
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        else:
-            bot.edit_message_text("❌ Hugging Face Server is busy. Try Free mode or try again later.", call.message.chat.id, call.message.message_id)
+    # 1. Send to Gemini for enhancement
+    smart_prompt = enhance_prompt(user_text)
+    
+    # 2. Generate Image using Pollinations AI (Free Unlimited Logic)
+    safe_prompt = urllib.parse.quote(smart_prompt)
+    image_url = f"https://image.pollinations.ai/prompt/{safe_prompt}?width=1024&height=1024&nologo=true"
+    
+    caption = f"👤 **Your Input:** `{user_text}`\n✨ **Enhanced by AI:** `{smart_prompt}`"
+    
+    # Truncate caption if it's too long (Telegram limit is 1024 chars for photo captions)
+    if len(caption) > 1000:
+        caption = caption[:1000] + "..."
+    
+    try:
+        bot.send_photo(message.chat.id, image_url, caption=caption, parse_mode="Markdown")
+        bot.delete_message(message.chat.id, processing_msg.message_id)
+    except Exception as e:
+        print(f"Image Generation Error: {e}")
+        bot.edit_message_text("❌ Error generating image. Please try a different prompt.", message.chat.id, processing_msg.message_id)
 
 # ===================== KEEP ALIVE SERVER =====================
 class DummyServer(BaseHTTPRequestHandler):
@@ -186,6 +165,6 @@ def keep_alive():
 threading.Thread(target=keep_alive, daemon=True).start()
 
 if __name__ == "__main__":
-    print("[+] Freemium Bot Running...")
+    print("[+] Simple Image Bot Running...")
     bot.infinity_polling()
         
