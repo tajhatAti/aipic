@@ -1,0 +1,7 @@
+telethon>=1.36.0
+aiohttp
+python-dotenv
+psutil
+requests
+Pillow
+supabase>=2.0.0
